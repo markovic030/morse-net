@@ -1,8 +1,18 @@
-
 import { ChatMessage, Room, User } from '../types';
 import { db } from '../firebaseConfig';
-import firebase from 'firebase/app';
-import 'firebase/database';
+// Import the specific functions from the Modular SDK
+import { 
+  ref, 
+  set, 
+  push, 
+  onValue, 
+  remove, 
+  update, 
+  onDisconnect, 
+  query, 
+  limitToLast,
+  Unsubscribe
+} from 'firebase/database';
 
 // Standard Amateur Radio CW Frequencies
 export const AVAILABLE_ROOMS: Room[] = [
@@ -14,8 +24,6 @@ export const AVAILABLE_ROOMS: Room[] = [
 ];
 
 // DATA NAMESPACING
-// We prefix all paths with 'morse_chat/' so this app doesn't accidentally 
-// overwrite data from your 'renotrack' app if it uses the Realtime Database.
 const DB_PREFIX = 'morse_chat';
 
 class ChatService {
@@ -25,10 +33,10 @@ class ChatService {
     private currentUser: User | null = null;
     private currentRoomId: string | null = null;
     
-    // Firebase References (v8 / compat style)
-    private msgRef: firebase.database.Query | null = null;
-    private realtimeMsgRef: firebase.database.Query | null = null;
-    private usersRef: firebase.database.Reference | null = null;
+    // In Modular SDK, we store the "unsubscribe" functions returned by onValue
+    private unsubscribeUsers: Unsubscribe | null = null;
+    private unsubscribeMsgs: Unsubscribe | null = null;
+    private unsubscribeRealtime: Unsubscribe | null = null;
 
     constructor() {}
 
@@ -41,18 +49,22 @@ class ChatService {
         this.currentRoomId = roomId;
 
         // 1. Add User to Firebase Presence System
-        // Path: morse_chat/rooms/{roomId}/users/{userId}
-        const userRef = db.ref(`${DB_PREFIX}/rooms/${roomId}/users/${user.id}`);
+        // New Syntax: ref(db, path)
+        const userRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users/${user.id}`);
         
         // Set user data
-        await userRef.set({ ...user, isLocal: false });
+        // New Syntax: set(ref, data)
+        await set(userRef, { ...user, isLocal: false });
 
-        // Magic trick: Remove user automatically if they close the tab or lose internet
-        userRef.onDisconnect().remove();
+        // Magic trick: Remove user automatically if they close the tab
+        // New Syntax: onDisconnect(ref).remove()
+        onDisconnect(userRef).remove();
 
         // 2. Listen for Users in this room
-        this.usersRef = db.ref(`${DB_PREFIX}/rooms/${roomId}/users`);
-        this.usersRef.on('value', (snapshot) => {
+        const usersRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users`);
+        
+        // New Syntax: onValue(ref, callback) returns the unsubscribe function
+        this.unsubscribeUsers = onValue(usersRef, (snapshot) => {
             const data = snapshot.val();
             const userList: User[] = [];
             if (data) {
@@ -67,14 +79,19 @@ class ChatService {
         });
 
         // 3. Listen for Messages (Last 50)
-        // Path: morse_chat/rooms/{roomId}/messages
-        this.msgRef = db.ref(`${DB_PREFIX}/rooms/${roomId}/messages`).limitToLast(50);
+        // New Syntax: query(ref, limitToLast(X))
+        const messagesRef = query(
+            ref(db, `${DB_PREFIX}/rooms/${roomId}/messages`), 
+            limitToLast(50)
+        );
         
-        // Listen to 'child_added' equivalent for audio playback
         // We capture new messages arriving to trigger audio
-        this.realtimeMsgRef = db.ref(`${DB_PREFIX}/rooms/${roomId}/messages`).limitToLast(1);
+        const realtimeRef = query(
+            ref(db, `${DB_PREFIX}/rooms/${roomId}/messages`), 
+            limitToLast(1)
+        );
         
-        this.realtimeMsgRef.on('value', (snapshot) => {
+        this.unsubscribeRealtime = onValue(realtimeRef, (snapshot) => {
             const data = snapshot.val();
             if (data) {
                 const msg = Object.values(data)[0] as ChatMessage;
@@ -86,13 +103,11 @@ class ChatService {
         });
         
         // We also want to load history immediately for the UI
-        this.msgRef.on('value', (snapshot) => {
-             // This listener fires once with the last 50 messages, then updates
-             const data = snapshot.val();
-             if (data) {
-                 // For now, we iterate and send them if needed, but the realtimeMsgRef handles the "new" ones
-                 // logic preserved from original file structure
-             }
+        // In this implementation, we just attach a listener for the history query
+        this.unsubscribeMsgs = onValue(messagesRef, (snapshot) => {
+             // In the modular version, we just let the UI handle the list updates
+             // If you need to populate an initial list, you can do it here, 
+             // but usually the realtime listener handles the "new" stuff.
         });
     }
 
@@ -100,25 +115,33 @@ class ChatService {
         if (!this.currentUser || !this.currentRoomId) return;
 
         // Remove user from DB manually
-        const userRef = db.ref(`${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
-        userRef.remove();
+        const userRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
+        remove(userRef);
 
-        // Detach listeners
-        if (this.usersRef) this.usersRef.off();
-        if (this.msgRef) this.msgRef.off();
-        if (this.realtimeMsgRef) this.realtimeMsgRef.off();
+        // Detach listeners using the unsubscribe functions
+        if (this.unsubscribeUsers) {
+            this.unsubscribeUsers();
+            this.unsubscribeUsers = null;
+        }
+        if (this.unsubscribeMsgs) {
+            this.unsubscribeMsgs();
+            this.unsubscribeMsgs = null;
+        }
+        if (this.unsubscribeRealtime) {
+            this.unsubscribeRealtime();
+            this.unsubscribeRealtime = null;
+        }
 
         this.currentRoomId = null;
-        this.msgRef = null;
-        this.realtimeMsgRef = null;
-        this.usersRef = null;
     }
 
     public sendMessage(text: string) {
         if (!this.currentUser || !this.currentRoomId) return;
 
-        const msgsRef = db.ref(`${DB_PREFIX}/rooms/${this.currentRoomId}/messages`);
-        const newMsgRef = msgsRef.push();
+        const msgsRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/messages`);
+        
+        // New Syntax: push(ref) creates a new reference with a unique key
+        const newMsgRef = push(msgsRef);
         
         const msg: ChatMessage = {
             id: newMsgRef.key!,
@@ -128,14 +151,14 @@ class ChatService {
             timestamp: Date.now()
         };
 
-        newMsgRef.set(msg);
+        set(newMsgRef, msg);
     }
 
     public updateStatus(status: 'tx' | 'rx' | 'idle') {
         if (!this.currentUser || !this.currentRoomId) return;
         
-        const userRef = db.ref(`${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
-        userRef.update({ status });
+        const userRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
+        update(userRef, { status });
     }
 
     // --- Subscriptions ---
@@ -152,7 +175,6 @@ class ChatService {
 
     public subscribeToUsers(callback: (users: User[]) => void) {
         this.userListeners.push(callback);
-        // Initial push if we have data (omitted to match original flow mostly)
         return () => {
             this.userListeners = this.userListeners.filter(l => l !== callback);
         };
