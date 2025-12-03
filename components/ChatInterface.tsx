@@ -61,7 +61,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             <div className="flex-1 relative overflow-hidden flex">
                 
                 {/* Chat History */}
-                <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth">
+                <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 p-4 space-y-4 scroll-smooth">
                     {messages.length === 0 && (
                         <div className="h-full flex flex-col items-center justify-center text-textMuted opacity-50 space-y-2 select-none">
                             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round">
