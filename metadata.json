@@ -1,0 +1,5 @@
+{
+  "name": "Morse Pro Chat",
+  "description": "Real-time Morse Code Chat powered by Gemini 2.5. Features high-fidelity keyer mechanics (Iambic A/B, Straight) and audio-visual feedback.",
+  "requestFramePermissions": []
+}
