@@ -1,6 +1,6 @@
 import { ChatMessage, Room, User } from '../types';
 // CORRECTED IMPORT: Goes up one folder to find firebaseConfig in src/
-import { db } from '../firebaseConfig'; 
+import { db } from '../src/firebaseConfig'; 
 import { 
   ref, 
   set, 
