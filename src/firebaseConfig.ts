@@ -12,7 +12,7 @@ const firebaseConfig = {
   measurementId: "G-Z1GJ2D8MY0",
   // 2. CRITICAL: Realtime Database needs this URL to connect!
   // I constructed this based on your projectId.
-  databaseURL: "https://arched-lens-451511-d3-default-rtdb.firebaseio.com" 
+  databaseURL: "https://arched-lens-451511-d3-default-rtdb.europe-west1.firebasedatabase.app"
 };
 
 // 3. Initialize Firebase
