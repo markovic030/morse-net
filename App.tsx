@@ -47,83 +47,111 @@ const App: React.FC = () => {
 
     const { setPaddle, playString, isTransmitting, stopTone } = useMorseKeyer(settings, handleCharDecoded, handleWordGap);
 
+// =========================================================
+    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE (SCHEDULER VERSION)
     // =========================================================
-    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE
-    // =========================================================
-    // We need a dedicated oscillator for the *remote* signal so it doesn't 
-    // conflict with your local keyer's state.
     const remoteAudioCtx = useRef<AudioContext | null>(null);
     const remoteOsc = useRef<OscillatorNode | null>(null);
     const remoteGain = useRef<GainNode | null>(null);
 
-    const startRemoteTone = useCallback(() => {
+    // Ensure Context Exists
+    const getRemoteCtx = useCallback(() => {
         if (!remoteAudioCtx.current) {
             remoteAudioCtx.current = new (window.AudioContext || (window as any).webkitAudioContext)();
         }
-        if (remoteAudioCtx.current.state === 'suspended') {
-            remoteAudioCtx.current.resume();
-        }
-        
-        // If already playing, don't restart
-        if (remoteOsc.current) return;
-
-        const osc = remoteAudioCtx.current.createOscillator();
-        const gain = remoteAudioCtx.current.createGain();
-
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(settings.tone, remoteAudioCtx.current.currentTime); // Use same tone as settings
-        
-        gain.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
-        gain.gain.linearRampToValueAtTime(0.5, remoteAudioCtx.current.currentTime + 0.005); // Smooth attack
-
-        osc.connect(gain);
-        gain.connect(remoteAudioCtx.current.destination);
-        osc.start();
-
-        remoteOsc.current = osc;
-        remoteGain.current = gain;
-    }, [settings.tone]);
-
-    const stopRemoteTone = useCallback(() => {
-        if (remoteOsc.current && remoteGain.current && remoteAudioCtx.current) {
-            const osc = remoteOsc.current;
-            const gain = remoteGain.current;
-            const ctx = remoteAudioCtx.current;
-
-            // Smooth release
-            gain.gain.setValueAtTime(gain.gain.value, ctx.currentTime);
-            gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.005);
-            
-            setTimeout(() => {
-                osc.stop();
-                osc.disconnect();
-                gain.disconnect();
-            }, 10); // Wait for release
-
-            remoteOsc.current = null;
-            remoteGain.current = null;
-        }
+        return remoteAudioCtx.current;
     }, []);
+
+    // This function schedules a signal change at a specific time in the future
+    const scheduleRemoteSignal = useCallback((state: 0 | 1, time: number) => {
+        const ctx = getRemoteCtx();
+        if (ctx.state === 'suspended') ctx.resume();
+
+        if (state === 1) {
+            // --- KEY DOWN (START TONE) ---
+            // If an oscillator is already scheduled or playing, stop it first to prevent overlap
+            if (remoteOsc.current) {
+                try {
+                    remoteOsc.current.stop(time);
+                    remoteOsc.current.disconnect();
+                } catch (e) { /* Ignore if already stopped */ }
+            }
+
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(settings.tone, time);
+
+            // Smooth Attack (Prevent Clicking)
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(0.5, time + 0.005); // 5ms attack
+
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            
+            osc.start(time);
+
+            remoteOsc.current = osc;
+            remoteGain.current = gain;
+
+        } else {
+            // --- KEY UP (STOP TONE) ---
+            if (remoteOsc.current && remoteGain.current) {
+                const osc = remoteOsc.current;
+                const gain = remoteGain.current;
+
+                // Smooth Release (Prevent Clicking)
+                // We schedule the volume to drop to 0 starting at 'time'
+                gain.gain.setValueAtTime(0.5, time);
+                gain.gain.linearRampToValueAtTime(0, time + 0.005); // 5ms release
+
+                // Stop the oscillator slightly after the volume hits 0
+                osc.stop(time + 0.01);
+                
+                // Cleanup references
+                // We don't null them immediately because the sound is still finishing (release)
+                // But logic-wise, we consider it stopped.
+            }
+        }
+    }, [getRemoteCtx, settings.tone]);
 
     // =========================================================
     // 2. TRUE REMOTE KEYING: RECEIVER (JITTER BUFFER)
     // =========================================================
-    // Initialize the Time Machine
-    const { addEvent } = useJitterBuffer(startRemoteTone, stopRemoteTone);
+    
+    // We pass the Context and the Scheduler function to the hook
+    const { addEvent } = useJitterBuffer(remoteAudioCtx.current, scheduleRemoteSignal);
+
+    // Initialize Audio Context on first user interaction (browser policy)
+    useEffect(() => {
+        const initAudio = () => { getRemoteCtx(); };
+        window.addEventListener('click', initAudio, { once: true });
+        window.addEventListener('keydown', initAudio, { once: true });
+        return () => {
+            window.removeEventListener('click', initAudio);
+            window.removeEventListener('keydown', initAudio);
+        };
+    }, [getRemoteCtx]);
 
     // Subscribe to incoming raw signals
     useEffect(() => {
-        // Only subscribe if we are in a room
         if (view === 'chat' && currentRoomId) {
+            // Make sure context is created when entering chat
+            getRemoteCtx(); 
+            
             const unsubSignals = chatService.subscribeToSignals((event) => {
                 addEvent(event);
             });
             return () => {
                 unsubSignals();
-                stopRemoteTone(); // Cleanup on unmount/leave
+                // Force stop any lingering sound
+                if (remoteAudioCtx.current) {
+                    scheduleRemoteSignal(0, remoteAudioCtx.current.currentTime);
+                }
             };
         }
-    }, [view, currentRoomId, addEvent, stopRemoteTone]);
+    }, [view, currentRoomId, addEvent, getRemoteCtx, scheduleRemoteSignal]);
 
 
     // =========================================================
