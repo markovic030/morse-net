@@ -8,34 +8,38 @@ export const useJitterBuffer = (
     scheduleSignal: (state: 0 | 1, time: number) => void
 ) => {
     const timeOffset = useRef<number | null>(null);
-    // Tracks the current state of the remote key (starts at 0 = UP)
-    const remoteState = useRef<0 | 1>(0);
+    
+    // Safety: Auto-kill tone if it gets stuck
+    const watchdogTimer = useRef<NodeJS.Timeout | null>(null);
 
     const addBatch = (batch: SignalBatch) => {
         if (!ctx) return;
 
-        // Sync Clock on First Batch
         if (timeOffset.current === null) {
             const targetTime = ctx.currentTime + (BUFFER_MS / 1000);
             timeOffset.current = targetTime - (batch.baseTime / 1000);
         }
 
-        // Calculate when this batch starts playing
         const batchStartTime = (batch.baseTime / 1000) + timeOffset.current;
         
-        // Schedule every event in the batch
-        batch.events.forEach((relativeOffset) => {
-            // Toggle state: If we were UP, now we are DOWN.
-            const newState = remoteState.current === 0 ? 1 : 0;
+        batch.events.forEach((event) => {
+            // event is now { off: number, state: 0 | 1 }
+            const playTime = Math.max(ctx.currentTime, batchStartTime + (event.off / 1000));
             
-            // Calculate exact time for this specific dit/dah
-            // Math.max ensures we don't crash by scheduling in the past
-            const playTime = Math.max(ctx.currentTime, batchStartTime + (relativeOffset / 1000));
+            // 1. Schedule the EXPLICIT state (No toggling!)
+            scheduleSignal(event.state, playTime);
             
-            scheduleSignal(newState, playTime);
-            
-            // Update state tracker
-            remoteState.current = newState;
+            // 2. Watchdog Logic
+            if (event.state === 1) {
+                // If turning ON, set a safety timer to turn it OFF in 3 seconds
+                if (watchdogTimer.current) clearTimeout(watchdogTimer.current);
+                watchdogTimer.current = setTimeout(() => {
+                    scheduleSignal(0, ctx.currentTime);
+                }, 3000);
+            } else {
+                // If turning OFF, clear the safety timer
+                if (watchdogTimer.current) clearTimeout(watchdogTimer.current);
+            }
         });
     };
 
