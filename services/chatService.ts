@@ -145,9 +145,7 @@ class ChatService {
 public subscribeToSignals(callback: (event: SignalEvent) => void) {
         if (!this.currentRoomId) return () => {};
 
-        // 1. Capture the exact time we started listening
-        const subscriptionStartTime = Date.now();
-
+        // Listen to last 100 events
         const signalsRef = query(
             ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/signals`),
             limitToLast(100) 
@@ -156,10 +154,10 @@ public subscribeToSignals(callback: (event: SignalEvent) => void) {
         const unsub = onChildAdded(signalsRef, (snapshot) => {
             const event = snapshot.val() as SignalEvent;
             
-            // 2. STRICT FILTER: 
-            // Only allow events that happened AFTER we subscribed.
-            // This effectively mutes all "history" so we start fresh.
-            if (event.timestamp > subscriptionStartTime && event.senderId !== this.currentUser?.id) {
+            // REMOVED THE TIMESTAMP FILTER
+            // We only check senderId. The Jitter Buffer will handle "old" packets
+            // by discarding them if they are too far in the past.
+            if (event.senderId !== this.currentUser?.id) {
                 callback(event);
             }
         });
