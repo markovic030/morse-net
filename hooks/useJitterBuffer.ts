@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { SignalBatch } from '../types';
 
-const BUFFER_MS = 500; 
+const BUFFER_MS = 200; 
 
 export const useJitterBuffer = (
     ctx: AudioContext | null, 
