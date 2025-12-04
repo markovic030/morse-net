@@ -37,3 +37,9 @@ export interface PaddleState {
     leftPressed: boolean;
     rightPressed: boolean;
 }
+export interface SignalEvent {
+    senderId: string;
+    state: 0 | 1;      // 0 = Silence (Key Up), 1 = Tone (Key Down)
+    seq: number;       // To detect lost packets
+    timestamp: number; // Sender's local time
+}
