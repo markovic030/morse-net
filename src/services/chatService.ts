@@ -1,6 +1,7 @@
-import { ChatMessage, Room, User } from '../types';
-import { db } from '../firebaseConfig';
-// Import the specific functions from the Modular SDK
+import { ChatMessage, Room, User, SignalEvent } from '../types'; // Added SignalEvent
+// Ensure this path is correct for your project structure.
+// If firebaseConfig is in src/ and this file is in src/services/, use ../firebaseConfig
+import { db } from '../firebaseConfig'; 
 import { 
   ref, 
   set, 
@@ -49,21 +50,17 @@ class ChatService {
         this.currentRoomId = roomId;
 
         // 1. Add User to Firebase Presence System
-        // New Syntax: ref(db, path)
         const userRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users/${user.id}`);
         
         // Set user data
-        // New Syntax: set(ref, data)
         await set(userRef, { ...user, isLocal: false });
 
         // Magic trick: Remove user automatically if they close the tab
-        // New Syntax: onDisconnect(ref).remove()
         onDisconnect(userRef).remove();
 
         // 2. Listen for Users in this room
         const usersRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users`);
         
-        // New Syntax: onValue(ref, callback) returns the unsubscribe function
         this.unsubscribeUsers = onValue(usersRef, (snapshot) => {
             const data = snapshot.val();
             const userList: User[] = [];
@@ -79,7 +76,6 @@ class ChatService {
         });
 
         // 3. Listen for Messages (Last 50)
-        // New Syntax: query(ref, limitToLast(X))
         const messagesRef = query(
             ref(db, `${DB_PREFIX}/rooms/${roomId}/messages`), 
             limitToLast(50)
@@ -103,11 +99,8 @@ class ChatService {
         });
         
         // We also want to load history immediately for the UI
-        // In this implementation, we just attach a listener for the history query
         this.unsubscribeMsgs = onValue(messagesRef, (snapshot) => {
-             // In the modular version, we just let the UI handle the list updates
-             // If you need to populate an initial list, you can do it here, 
-             // but usually the realtime listener handles the "new" stuff.
+             // Optional: Handle history load
         });
     }
 
@@ -153,6 +146,55 @@ class ChatService {
 
         set(newMsgRef, msg);
     }
+
+    // --- NEW: Signal Methods for True Remote Keying ---
+
+    public sendSignal(state: 0 | 1) {
+        if (!this.currentUser || !this.currentRoomId) return;
+
+        // We use a separate path for signals to keep chat clean
+        // Note: Using 'push' ensures unique IDs and chronological order
+        const signalRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/signals`);
+        
+        const event: SignalEvent = {
+            senderId: this.currentUser.id,
+            state: state,
+            seq: Date.now(), // Simple sequence ID using timestamp
+            timestamp: Date.now()
+        };
+
+        // Push the event to the database
+        // We rely on removeOnDisconnect or manual cleanup for these transient events if needed,
+        // but for a prototype, this is fine. You might want to implement a cleanup strategy later.
+        push(signalRef, event);
+    }
+
+    public subscribeToSignals(callback: (event: SignalEvent) => void) {
+        if (!this.currentRoomId) return () => {};
+
+        // Listen for the very last signal event
+        const signalsRef = query(
+            ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/signals`),
+            limitToLast(1) 
+        );
+
+        const unsub = onValue(signalsRef, (snapshot) => {
+            const data = snapshot.val();
+            if (data) {
+                // Get the latest event object
+                const event = Object.values(data)[0] as SignalEvent;
+                
+                // Only pass it to the callback if it's NOT from us (the current user)
+                if (event.senderId !== this.currentUser?.id) {
+                    callback(event);
+                }
+            }
+        });
+
+        return unsub;
+    }
+
+    // --------------------------------------------------
 
     public updateStatus(status: 'tx' | 'rx' | 'idle') {
         if (!this.currentUser || !this.currentRoomId) return;
