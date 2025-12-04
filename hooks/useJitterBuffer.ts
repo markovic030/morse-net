@@ -3,7 +3,7 @@ import { SignalEvent } from '../types';
 
 // INCREASED BUFFER: 300ms allows for more network hiccups without stuttering.
 // If it still stutters, try 400 or 500.
-const BUFFER_DELAY_MS = 500; 
+const BUFFER_DELAY_MS = 1000; 
 
 export const useJitterBuffer = (
     playTone: () => void, 
