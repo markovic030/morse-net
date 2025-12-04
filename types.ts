@@ -37,16 +37,20 @@ export interface PaddleState {
     leftPressed: boolean;
     rightPressed: boolean;
 }
+
+// Legacy single event (can keep for reference or removal later)
 export interface SignalEvent {
     senderId: string;
     state: 0 | 1;      // 0 = Silence (Key Up), 1 = Tone (Key Down)
     seq: number;       // To detect lost packets
     timestamp: number; // Sender's local time
 }
-// Add this to your src/types.ts
+
+// --- NEW BATCHING STRUCTURE ---
 export interface SignalBatch {
     senderId: string;
-    baseTime: number; // The timestamp of the first event in this batch
-    events: number[]; // Relative offsets: [0, 80, 150, 230] (On at 0, Off at 80, On at 150...)
+    baseTime: number; 
+    // UPDATED: Now stores explicit state to prevent "Infinite Tone" glitches
+    events: { off: number; state: 0 | 1 }[]; 
     seq: number;
 }
