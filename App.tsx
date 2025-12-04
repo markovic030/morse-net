@@ -6,7 +6,6 @@ import { Lobby } from './components/Lobby';
 import { chatService, AVAILABLE_ROOMS } from './services/chatService';
 import { KeyerSettings, ChatMessage, User } from './types';
 import { Settings } from 'lucide-react';
-// NEW: Import the Jitter Buffer hook (Ensure useJitterBuffer is updated to handle batches!)
 import { useJitterBuffer } from './hooks/useJitterBuffer';
 
 type AppState = 'login' | 'lobby' | 'chat';
@@ -48,12 +47,11 @@ const App: React.FC = () => {
     const { setPaddle, playString, isTransmitting, stopTone } = useMorseKeyer(settings, handleCharDecoded, handleWordGap);
 
     // =========================================================
-    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE (ALWAYS HOT)
+    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE (BUTTERY SMOOTH)
     // =========================================================
     const remoteAudioCtx = useRef<AudioContext | null>(null);
     const remoteOsc = useRef<OscillatorNode | null>(null);
     const remoteGain = useRef<GainNode | null>(null);
-    // Master gain to mute remote audio instantly when WE are transmitting
     const masterRemoteGain = useRef<GainNode | null>(null);
 
     const initRemoteAudio = useCallback(() => {
@@ -67,8 +65,8 @@ const App: React.FC = () => {
         if (!remoteOsc.current) {
             const ctx = remoteAudioCtx.current;
             const osc = ctx.createOscillator();
-            const gain = ctx.createGain(); // Signal Envelope
-            const master = ctx.createGain(); // Mute Switch
+            const gain = ctx.createGain(); 
+            const master = ctx.createGain(); 
 
             osc.type = 'sine';
             osc.frequency.setValueAtTime(settings.tone, ctx.currentTime);
@@ -76,7 +74,7 @@ const App: React.FC = () => {
             // Signal starts silent
             gain.gain.setValueAtTime(0, ctx.currentTime);
             
-            // Master starts fully open (volume 1)
+            // Master starts fully open
             master.gain.setValueAtTime(1, ctx.currentTime);
 
             osc.connect(gain);
@@ -109,14 +107,19 @@ const App: React.FC = () => {
 
         const safeTime = Math.max(time, ctx.currentTime);
 
+        // SOFTEN THE EDGES:
+        // Changed from 0.005 (5ms) to 0.015 (15ms).
+        // This removes the "Digital Click" sound entirely.
+        const RAMP_DURATION = 0.015;
+
+        // Cancel overlapping ramps to prevent error
+        gain.gain.cancelScheduledValues(safeTime);
+        gain.gain.setValueAtTime(gain.gain.value, safeTime); // Lock current value before ramping
+
         if (state === 1) {
-            // Volume Up (Tone On)
-            gain.gain.setValueAtTime(0, safeTime); 
-            gain.gain.linearRampToValueAtTime(0.5, safeTime + 0.005); 
+            gain.gain.linearRampToValueAtTime(0.5, safeTime + RAMP_DURATION); 
         } else {
-            // Volume Down (Tone Off)
-            gain.gain.setValueAtTime(0.5, safeTime); 
-            gain.gain.linearRampToValueAtTime(0, safeTime + 0.005); 
+            gain.gain.linearRampToValueAtTime(0, safeTime + RAMP_DURATION); 
         }
     }, [initRemoteAudio]);
 
@@ -133,7 +136,7 @@ const App: React.FC = () => {
                 addEvent(batch);
             });
             return () => {
-                if (unsubSignals) unsubSignals(); // Ensure it's a function before calling
+                if (unsubSignals) unsubSignals();
                 if (remoteAudioCtx.current && remoteGain.current) {
                      remoteGain.current.gain.cancelScheduledValues(remoteAudioCtx.current.currentTime);
                      remoteGain.current.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
@@ -144,25 +147,32 @@ const App: React.FC = () => {
 
 
     // =========================================================
-    // 3. TRUE REMOTE KEYING: SENDER (INSTANT MUTE)
+    // 3. TRUE REMOTE KEYING: SENDER (SMOOTH MUTE)
     // =========================================================
     useEffect(() => {
         if (view === 'chat') {
             chatService.updateStatus(isTransmitting ? 'tx' : 'idle');
             chatService.sendSignal(isTransmitting ? 1 : 0);
 
-            // --- INSTANT MUTE FIX (Fixes Sticky Paddles) ---
+            // --- SMOOTH MUTE FIX ---
+            // Fixes "Crackling" when you press paddles
             if (remoteAudioCtx.current && masterRemoteGain.current) {
                 const now = remoteAudioCtx.current.currentTime;
+                
+                // Cancel conflicting ramps first
+                masterRemoteGain.current.gain.cancelScheduledValues(now);
+                masterRemoteGain.current.gain.setValueAtTime(masterRemoteGain.current.gain.value, now);
+
                 if (isTransmitting) {
-                    // Mute remote audio instantly so we hear ourselves clearly
-                    masterRemoteGain.current.gain.cancelScheduledValues(now);
-                    masterRemoteGain.current.gain.setValueAtTime(0, now);
+                    // FAST FADE OUT (10ms) instead of INSTANT SNAP
+                    // This eliminates the "Pop" when you start typing.
+                    masterRemoteGain.current.gain.linearRampToValueAtTime(0, now + 0.01);
                 } else {
-                    // Unmute remote audio slightly after we stop (50ms buffer)
-                    // This prevents "blips" if we are typing fast.
-                    masterRemoteGain.current.gain.setValueAtTime(0, now);
-                    masterRemoteGain.current.gain.linearRampToValueAtTime(1, now + 0.1); // Smooth unmute
+                    // SLOW FADE IN (100ms)
+                    // We wait 50ms before starting, then fade in over 50ms.
+                    // This prevents "flutter" between words.
+                    masterRemoteGain.current.gain.setValueAtTime(0, now + 0.05);
+                    masterRemoteGain.current.gain.linearRampToValueAtTime(1, now + 0.1);
                 }
             }
         }
