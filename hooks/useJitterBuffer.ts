@@ -1,37 +1,35 @@
 import { useEffect, useRef } from 'react';
 import { SignalEvent } from '../types';
 
-// How far ahead to schedule audio (100ms)
-// This allows React to "freeze" for up to 100ms without glitching the audio.
+// Buffer: 500ms is a safe starting point for mobile networks
+const BUFFER_MS = 500; 
 const LOOKAHEAD_MS = 100;
 
-// Network Buffer (still need this for internet jitter)
-const BUFFER_MS = 500; 
-
 export const useJitterBuffer = (
-    ctx: AudioContext | null, // We now need the AudioContext to schedule time
+    ctx: AudioContext | null, 
     scheduleSignal: (state: 0 | 1, time: number) => void
 ) => {
     const queue = useRef<SignalEvent[]>([]);
     const timeOffset = useRef<number | null>(null);
     
-    // We strictly assume the sequence is ordered (Key Down -> Key Up)
-    // If we lose a packet, we might get stuck, so we need a watchdog.
+    // We track the Sender's time of the last processed event
+    // to preserve the relative rhythm (duration between Down and Up)
+    const lastSenderTime = useRef<number | null>(null);
     const lastScheduledTime = useRef<number>(0);
 
     const addEvent = (event: SignalEvent) => {
         if (!ctx) return;
 
-        // Initialize sync if this is the first packet
+        // Initialize sync on first packet
         if (timeOffset.current === null) {
-            // Target Audio Time = Current Audio Time + Buffer
-            // We map Sender Time -> Audio Context Time
             const targetTime = ctx.currentTime + (BUFFER_MS / 1000);
             timeOffset.current = targetTime - (event.timestamp / 1000);
         }
         
         queue.current.push(event);
-        queue.current.sort((a, b) => a.timestamp - b.timestamp);
+        // Important: Sort by Sequence ID if available, else Timestamp
+        // This fixes "out of order" packet arrival
+        queue.current.sort((a, b) => (a.seq || a.timestamp) - (b.seq || b.timestamp));
     };
 
     useEffect(() => {
@@ -43,38 +41,48 @@ export const useJitterBuffer = (
                 return;
             }
 
-            // Look ahead window: Current Time + Lookahead
             const lookaheadTime = ctx.currentTime + (LOOKAHEAD_MS / 1000);
 
-            // Check queue for events that fall within this window
             while (queue.current.length > 0) {
                 const nextEvent = queue.current[0];
                 
-                // Calculate the exact second this should play
-                const scheduledTime = (nextEvent.timestamp / 1000) + timeOffset.current;
+                // Calculate ideal play time based on initial sync
+                let scheduledTime = (nextEvent.timestamp / 1000) + timeOffset.current;
+
+                // DURATION PRESERVATION LOGIC:
+                // If this is a "Key Up" (0) following a "Key Down" (1),
+                // we must ensure the duration is correct relative to the PREVIOUS packet.
+                // If we delayed the previous packet by 0.1s due to lag, we MUST delay this one too.
+                if (lastSenderTime.current !== null && lastScheduledTime.current > 0) {
+                    const duration = (nextEvent.timestamp - lastSenderTime.current) / 1000;
+                    // The play time must be at least (LastPlayTime + Duration)
+                    // This prevents "crushing" dits if the Up packet arrives early/late
+                    if (duration > 0) {
+                        scheduledTime = Math.max(scheduledTime, lastScheduledTime.current + duration);
+                    }
+                }
 
                 if (scheduledTime < lookaheadTime) {
-                    // It is time (or almost time) to play this!
-                    
-                    // Safety: Don't schedule in the past if latency spiked
+                    // Safety: Never schedule in the past
+                    // But if we shift it, update the offset so future notes stay in sync? 
+                    // For now, just clamping it creates a small stutter but preserves the note.
                     const playTime = Math.max(ctx.currentTime, scheduledTime);
                     
                     scheduleSignal(nextEvent.state, playTime);
+                    
+                    // Update trackers
                     lastScheduledTime.current = playTime;
+                    lastSenderTime.current = nextEvent.timestamp;
 
-                    // Remove from queue
                     queue.current.shift();
                 } else {
-                    // Next event is too far in the future, stop checking
                     break;
                 }
             }
-
             animationFrameId = requestAnimationFrame(scheduleLoop);
         };
 
         animationFrameId = requestAnimationFrame(scheduleLoop);
-
         return () => cancelAnimationFrame(animationFrameId);
     }, [ctx, scheduleSignal]);
 
