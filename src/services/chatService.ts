@@ -1,7 +1,7 @@
 import { ChatMessage, Room, User, SignalEvent } from '../types'; // Added SignalEvent
 // Ensure this path is correct for your project structure.
 // If firebaseConfig is in src/ and this file is in src/services/, use ../firebaseConfig
-import { db } from '../firebaseConfig'; 
+import { db } from '../src/firebaseConfig';
 import { 
   ref, 
   set, 
