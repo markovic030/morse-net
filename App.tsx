@@ -140,18 +140,29 @@ const App: React.FC = () => {
     }, [view, currentRoomId, addEvent, initRemoteAudio, scheduleRemoteSignal]); 
 
 
-    // =========================================================
+// =========================================================
     // 3. TRUE REMOTE KEYING: SENDER (BROADCAST)
     // =========================================================
     useEffect(() => {
         if (view === 'chat') {
-            // Update Presence Status (visual "TX" indicator)
             chatService.updateStatus(isTransmitting ? 'tx' : 'idle');
-
-            // --- SEND RAW SIGNAL ---
-            // Whenever your local keyer starts/stops transmitting, we send that state to the network.
-            // 1 = Key Down, 0 = Key Up
             chatService.sendSignal(isTransmitting ? 1 : 0);
+
+            // --- AUDIO CONFLICT FIX ---
+            // If we are transmitting, SUSPEND the remote audio engine.
+            // This frees up the AudioContext so your local paddles don't glitch.
+            if (remoteAudioCtx.current) {
+                if (isTransmitting) {
+                    if (remoteAudioCtx.current.state === 'running') {
+                        remoteAudioCtx.current.suspend();
+                    }
+                } else {
+                    // When we stop transmitting, wake it up to listen
+                    if (remoteAudioCtx.current.state === 'suspended') {
+                        remoteAudioCtx.current.resume();
+                    }
+                }
+            }
         }
     }, [isTransmitting, view]);
 
