@@ -1,7 +1,7 @@
 import { ChatMessage, Room, User, SignalBatch } from '../types'; 
 import { db } from '../src/firebaseConfig'; 
 import { 
-  ref, set, push, onChildAdded, remove, update, onDisconnect, query, limitToLast, Unsubscribe 
+  ref, set, push, onChildAdded, onValue, remove, update, onDisconnect, query, limitToLast, Unsubscribe 
 } from 'firebase/database';
 
 export const AVAILABLE_ROOMS: Room[] = [
@@ -19,7 +19,6 @@ class ChatService {
     private userListeners: ((users: User[]) => void)[] = [];
     
     // --- BATCHING STATE ---
-    // UPDATED: Buffer now stores objects { off, state }
     private batchBuffer: { off: number; state: 0 | 1 }[] = []; 
     private batchBaseTime: number | null = null;
     private batchTimer: NodeJS.Timeout | null = null;
@@ -27,9 +26,12 @@ class ChatService {
     
     private currentUser: User | null = null;
     private currentRoomId: string | null = null;
+    
+    // Listeners
     private unsubscribeUsers: Unsubscribe | null = null;
     private unsubscribeMsgs: Unsubscribe | null = null;
     private unsubscribeRealtime: Unsubscribe | null = null;
+    private unsubscribeSignals: Unsubscribe | null = null;
 
     constructor() {}
 
@@ -42,13 +44,10 @@ class ChatService {
 
         if (this.batchBaseTime === null) {
             this.batchBaseTime = now;
-            // UPDATED: Push object with Explicit State
             this.batchBuffer = [{ off: 0, state: state }]; 
-            
             this.batchTimer = setTimeout(() => this.flushBatch(), 100); 
         } else {
             const relativeTime = now - this.batchBaseTime;
-            // UPDATED: Push object
             this.batchBuffer.push({ off: relativeTime, state: state });
         }
     }
@@ -80,89 +79,114 @@ class ChatService {
             limitToLast(50) 
         );
 
-        const unsub = onChildAdded(signalsRef, (snapshot) => {
+        this.unsubscribeSignals = onChildAdded(signalsRef, (snapshot) => {
             const batch = snapshot.val() as SignalBatch;
+            // Ignore old batches (>10s ago) and our own batches
             if (Date.now() - batch.baseTime < 10000 && batch.senderId !== this.currentUser?.id) {
                 callback(batch);
             }
         });
 
-        return unsub;
+        return this.unsubscribeSignals;
     }
 
-    // --- STANDARD METHODS (Paste these back in exactly as they were) ---
-    // (I am omitting them to save space, but DO NOT DELETE THEM from your file)
+    // --- STANDARD METHODS (Restored) ---
+
     public async joinRoom(user: User, roomId: string) {
         if (this.currentRoomId) this.leaveRoom();
+
         this.currentUser = user;
         this.currentRoomId = roomId;
+
+        // 1. Add User to Presence
         const userRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users/${user.id}`);
         await set(userRef, { ...user, isLocal: false });
         onDisconnect(userRef).remove();
-        
+
+        // 2. Listen for Users (Use onValue for full list)
         const usersRef = ref(db, `${DB_PREFIX}/rooms/${roomId}/users`);
         this.unsubscribeUsers = onValue(usersRef, (snapshot) => {
             const data = snapshot.val();
             const userList: User[] = [];
-            if (data) { Object.values(data).forEach((u: any) => userList.push({ ...u, isLocal: u.id === this.currentUser?.id })); }
+            if (data) {
+                Object.values(data).forEach((u: any) => {
+                    userList.push({
+                        ...u,
+                        isLocal: u.id === this.currentUser?.id
+                    });
+                });
+            }
             this.notifyUserListeners(userList);
         });
 
+        // 3. Listen for Messages (History)
         const messagesRef = query(ref(db, `${DB_PREFIX}/rooms/${roomId}/messages`), limitToLast(50));
-        this.unsubscribeMsgs = onValue(messagesRef, () => {}); // History placeholder
-
-        // Realtime Messages (System Audio)
-        const realtimeRef = query(ref(db, `${DB_PREFIX}/rooms/${roomId}/messages`), limitToLast(1));
-        this.unsubscribeRealtime = onValue(realtimeRef, (snapshot) => {
-            const data = snapshot.val();
-            if (data) {
-                const msg = Object.values(data)[0] as ChatMessage;
-                if (Date.now() - msg.timestamp < 3000) this.notifyMessageListeners(msg);
-            }
+        // We use onChildAdded to build the list progressively
+        this.unsubscribeMsgs = onChildAdded(messagesRef, (snapshot) => {
+             const msg = snapshot.val() as ChatMessage;
+             this.notifyMessageListeners(msg);
         });
     }
 
     public leaveRoom() {
         if (!this.currentUser || !this.currentRoomId) return;
+
         const userRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
         remove(userRef);
+
         if (this.unsubscribeUsers) { this.unsubscribeUsers(); this.unsubscribeUsers = null; }
         if (this.unsubscribeMsgs) { this.unsubscribeMsgs(); this.unsubscribeMsgs = null; }
         if (this.unsubscribeRealtime) { this.unsubscribeRealtime(); this.unsubscribeRealtime = null; }
+        if (this.unsubscribeSignals) { this.unsubscribeSignals(); this.unsubscribeSignals = null; }
+
         this.currentRoomId = null;
     }
 
     public sendMessage(text: string) {
         if (!this.currentUser || !this.currentRoomId) return;
+
         const msgsRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/messages`);
         const newMsgRef = push(msgsRef);
+        
         const msg: ChatMessage = {
-            id: newMsgRef.key!, senderId: this.currentUser.id, senderCallsign: this.currentUser.callsign, text: text, timestamp: Date.now()
+            id: newMsgRef.key!,
+            senderId: this.currentUser.id,
+            senderCallsign: this.currentUser.callsign,
+            text: text,
+            timestamp: Date.now()
         };
+
         set(newMsgRef, msg);
     }
 
     public updateStatus(status: 'tx' | 'rx' | 'idle') {
         if (!this.currentUser || !this.currentRoomId) return;
+        
         const userRef = ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/users/${this.currentUser.id}`);
         update(userRef, { status });
     }
 
     public subscribeToMessages(callback: (msg: ChatMessage) => void) {
-        this.listeners.push(callback);
-        return () => { this.listeners = this.listeners.filter(l => l !== callback); };
+        this.messageListeners.push(callback);
+        return () => {
+            this.messageListeners = this.messageListeners.filter(l => l !== callback);
+        };
     }
-    
-    private get listeners() { return this.messageListeners; }
-    private set listeners(val) { this.messageListeners = val; }
 
     public subscribeToUsers(callback: (users: User[]) => void) {
         this.userListeners.push(callback);
-        return () => { this.userListeners = this.userListeners.filter(l => l !== callback); };
+        return () => {
+            this.userListeners = this.userListeners.filter(l => l !== callback);
+        };
     }
 
-    private notifyMessageListeners(msg: ChatMessage) { this.messageListeners.forEach(l => l(msg)); }
-    private notifyUserListeners(users: User[]) { this.userListeners.forEach(l => l(users)); }
+    private notifyMessageListeners(msg: ChatMessage) {
+        this.messageListeners.forEach(l => l(msg));
+    }
+
+    private notifyUserListeners(users: User[]) {
+        this.userListeners.forEach(l => l(users));
+    }
 }
 
 export const chatService = new ChatService();
