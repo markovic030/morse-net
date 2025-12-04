@@ -1,8 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { SignalEvent } from '../types';
 
-// How far behind real-time do we play? (150ms is a good balance for internet)
-const BUFFER_DELAY_MS = 150; 
+// INCREASED BUFFER: 300ms allows for more network hiccups without stuttering.
+// If it still stutters, try 400 or 500.
+const BUFFER_DELAY_MS = 500; 
 
 export const useJitterBuffer = (
     playTone: () => void, 
@@ -12,48 +13,57 @@ export const useJitterBuffer = (
     const timeOffset = useRef<number | null>(null);
     const lastState = useRef<0 | 1>(0);
     
-    // Safety: If no packet arrives for 2 seconds, kill sound (anti-stuck key)
+    // Safety & Cleanup timers
     const watchdogTimer = useRef<NodeJS.Timeout | null>(null);
+    const resyncTimer = useRef<NodeJS.Timeout | null>(null);
 
-    // 1. The "Push" function - ChatService calls this when data arrives
     const addEvent = (event: SignalEvent) => {
-        // If this is the FIRST packet we've ever seen from this stream,
-        // establish the time synchronization.
+        // If we have been silent for a long time, treat this as a "fresh" start
+        // This adapts to changing network conditions between sentences.
         if (timeOffset.current === null) {
-            // My Time = Sender Time + Network Latency + Buffer
-            // We approximate by saying: "Play this packet 150ms from NOW"
             const playTimeTarget = Date.now() + BUFFER_DELAY_MS;
             timeOffset.current = playTimeTarget - event.timestamp;
         }
         
         queue.current.push(event);
-        // Keep queue sorted just in case packets arrived out of order
+        // Keep queue sorted (critical for UDP-like jitter)
         queue.current.sort((a, b) => a.timestamp - b.timestamp);
+        
+        // Clear the "Resync" timer because we are actively receiving data
+        if (resyncTimer.current) clearTimeout(resyncTimer.current);
+        
+        // If no more data arrives for 2 seconds, we reset the sync
+        // This ensures the NEXT sentence calculates a fresh delay.
+        resyncTimer.current = setTimeout(() => {
+            timeOffset.current = null;
+        }, 2000);
     };
 
-    // 2. The Playback Loop - Runs 60 times a second
+    // The High-Precision Loop
     useEffect(() => {
         let animationFrameId: number;
 
         const processQueue = () => {
             const now = Date.now();
 
+            // Only process if we are synced and have data
             if (timeOffset.current !== null && queue.current.length > 0) {
-                // Peek at the first event
                 const nextEvent = queue.current[0];
                 const targetPlayTime = nextEvent.timestamp + timeOffset.current;
 
-                // Is it time to play this event yet?
+                // Is it time (or past time) to play this event?
                 if (now >= targetPlayTime) {
-                    // YES. Execute the state change.
+                    
+                    // EXECUTE STATE CHANGE
                     if (nextEvent.state === 1 && lastState.current === 0) {
                         playTone();
-                        // Reset watchdog
+                        // Reset stuck-key watchdog
                         if (watchdogTimer.current) clearTimeout(watchdogTimer.current);
+                        // Max tone duration 2s (safety)
                         watchdogTimer.current = setTimeout(() => {
                             stopTone();
                             lastState.current = 0;
-                        }, 2000); // 2s max tone duration
+                        }, 2000); 
                     } else if (nextEvent.state === 0 && lastState.current === 1) {
                         stopTone();
                         if (watchdogTimer.current) clearTimeout(watchdogTimer.current);
@@ -61,7 +71,7 @@ export const useJitterBuffer = (
 
                     lastState.current = nextEvent.state;
                     
-                    // Remove from queue
+                    // Remove processed event
                     queue.current.shift();
                 }
             }
@@ -74,6 +84,7 @@ export const useJitterBuffer = (
         return () => {
             cancelAnimationFrame(animationFrameId);
             if (watchdogTimer.current) clearTimeout(watchdogTimer.current);
+            if (resyncTimer.current) clearTimeout(resyncTimer.current);
             stopTone();
         };
     }, [playTone, stopTone]);
