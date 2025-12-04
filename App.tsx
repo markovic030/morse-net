@@ -6,7 +6,7 @@ import { Lobby } from './components/Lobby';
 import { chatService, AVAILABLE_ROOMS } from './services/chatService';
 import { KeyerSettings, ChatMessage, User } from './types';
 import { Settings } from 'lucide-react';
-// NEW: Import the Jitter Buffer hook
+// NEW: Import the Jitter Buffer hook (Ensure useJitterBuffer is updated to handle batches!)
 import { useJitterBuffer } from './hooks/useJitterBuffer';
 
 type AppState = 'login' | 'lobby' | 'chat';
@@ -48,13 +48,14 @@ const App: React.FC = () => {
     const { setPaddle, playString, isTransmitting, stopTone } = useMorseKeyer(settings, handleCharDecoded, handleWordGap);
 
     // =========================================================
-    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE (GATED VERSION)
+    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE (ALWAYS HOT)
     // =========================================================
     const remoteAudioCtx = useRef<AudioContext | null>(null);
     const remoteOsc = useRef<OscillatorNode | null>(null);
     const remoteGain = useRef<GainNode | null>(null);
+    // Master gain to mute remote audio instantly when WE are transmitting
+    const masterRemoteGain = useRef<GainNode | null>(null);
 
-    // Initialize the engine ONCE
     const initRemoteAudio = useCallback(() => {
         if (!remoteAudioCtx.current) {
             remoteAudioCtx.current = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -63,24 +64,30 @@ const App: React.FC = () => {
             remoteAudioCtx.current.resume();
         }
 
-        // Create a persistent oscillator if it doesn't exist
         if (!remoteOsc.current) {
             const ctx = remoteAudioCtx.current;
             const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
+            const gain = ctx.createGain(); // Signal Envelope
+            const master = ctx.createGain(); // Mute Switch
 
             osc.type = 'sine';
             osc.frequency.setValueAtTime(settings.tone, ctx.currentTime);
             
-            // Start silent
+            // Signal starts silent
             gain.gain.setValueAtTime(0, ctx.currentTime);
+            
+            // Master starts fully open (volume 1)
+            master.gain.setValueAtTime(1, ctx.currentTime);
 
             osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start(); // Start it now, let it run forever
+            gain.connect(master);
+            master.connect(ctx.destination);
+            
+            osc.start(); 
 
             remoteOsc.current = osc;
             remoteGain.current = gain;
+            masterRemoteGain.current = master;
         }
     }, [settings.tone]);
 
@@ -91,9 +98,8 @@ const App: React.FC = () => {
         }
     }, [settings.tone]);
 
-    // The Scheduler: Just automates the Volume (Gain)
+    // The Scheduler
     const scheduleRemoteSignal = useCallback((state: 0 | 1, time: number) => {
-        // Ensure engine is ready (though we try to init on join)
         initRemoteAudio();
         
         const ctx = remoteAudioCtx.current;
@@ -101,36 +107,33 @@ const App: React.FC = () => {
         
         if (!ctx || !gain) return;
 
-        // Safety: If 'time' is in the past, move it to 'now' to avoid errors
         const safeTime = Math.max(time, ctx.currentTime);
 
         if (state === 1) {
-            // OPEN GATE (Volume 0 -> 0.5)
+            // Volume Up (Tone On)
             gain.gain.setValueAtTime(0, safeTime); 
-            gain.gain.linearRampToValueAtTime(0.5, safeTime + 0.005); // 5ms attack
+            gain.gain.linearRampToValueAtTime(0.5, safeTime + 0.005); 
         } else {
-            // CLOSE GATE (Volume 0.5 -> 0)
+            // Volume Down (Tone Off)
             gain.gain.setValueAtTime(0.5, safeTime); 
-            gain.gain.linearRampToValueAtTime(0, safeTime + 0.005); // 5ms release
+            gain.gain.linearRampToValueAtTime(0, safeTime + 0.005); 
         }
     }, [initRemoteAudio]);
 
     // =========================================================
     // 2. TRUE REMOTE KEYING: RECEIVER (JITTER BUFFER)
     // =========================================================
-    
-    // We pass the Context and the Scheduler function to the hook
     const { addEvent } = useJitterBuffer(remoteAudioCtx.current, scheduleRemoteSignal);
 
     // Subscribe to incoming raw signals
     useEffect(() => {
         if (view === 'chat' && currentRoomId) {
-            const unsubSignals = chatService.subscribeToSignals((event) => {
-                addEvent(event);
+            initRemoteAudio(); 
+            const unsubSignals = chatService.subscribeToSignals((batch) => {
+                addEvent(batch);
             });
             return () => {
-                unsubSignals();
-                // Force stop any lingering sound
+                if (unsubSignals) unsubSignals(); // Ensure it's a function before calling
                 if (remoteAudioCtx.current && remoteGain.current) {
                      remoteGain.current.gain.cancelScheduledValues(remoteAudioCtx.current.currentTime);
                      remoteGain.current.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
@@ -140,31 +143,26 @@ const App: React.FC = () => {
     }, [view, currentRoomId, addEvent, initRemoteAudio, scheduleRemoteSignal]); 
 
 
-// =========================================================
-    // 3. TRUE REMOTE KEYING: SENDER (BROADCAST)
     // =========================================================
-useEffect(() => {
+    // 3. TRUE REMOTE KEYING: SENDER (INSTANT MUTE)
+    // =========================================================
+    useEffect(() => {
         if (view === 'chat') {
             chatService.updateStatus(isTransmitting ? 'tx' : 'idle');
             chatService.sendSignal(isTransmitting ? 1 : 0);
 
-            // --- AGGRESSIVE AUDIO OPTIMIZATION ---
-            if (remoteAudioCtx.current) {
+            // --- INSTANT MUTE FIX (Fixes Sticky Paddles) ---
+            if (remoteAudioCtx.current && masterRemoteGain.current) {
+                const now = remoteAudioCtx.current.currentTime;
                 if (isTransmitting) {
-                    // If we start typing, instantly SUSPEND remote audio.
-                    // This gives 100% CPU priority to your local keyer.
-                    if (remoteAudioCtx.current.state === 'running') {
-                        remoteAudioCtx.current.suspend();
-                    }
+                    // Mute remote audio instantly so we hear ourselves clearly
+                    masterRemoteGain.current.gain.cancelScheduledValues(now);
+                    masterRemoteGain.current.gain.setValueAtTime(0, now);
                 } else {
-                    // When we stop, wait a tiny bit (50ms) before resuming.
-                    // This prevents "thrashing" if you just paused for a split second between words.
-                    setTimeout(() => {
-                        // Only resume if we are still NOT transmitting
-                        if (!isTransmitting && remoteAudioCtx.current?.state === 'suspended') {
-                            remoteAudioCtx.current.resume();
-                        }
-                    }, 50);
+                    // Unmute remote audio slightly after we stop (50ms buffer)
+                    // This prevents "blips" if we are typing fast.
+                    masterRemoteGain.current.gain.setValueAtTime(0, now);
+                    masterRemoteGain.current.gain.linearRampToValueAtTime(1, now + 0.1); // Smooth unmute
                 }
             }
         }
@@ -175,8 +173,6 @@ useEffect(() => {
     useEffect(() => {
         const unsubMsg = chatService.subscribeToMessages((msg) => {
             setMessages(prev => [...prev, msg]);
-            
-            // MODIFIED: Only play computer-generated audio for SYSTEM messages.
             if (msg.isSystem && msg.senderId !== currentUser?.id) {
                 playString(msg.text); 
             }
@@ -187,8 +183,8 @@ useEffect(() => {
         });
 
         return () => {
-            unsubMsg();
-            unsubUsers();
+            if (unsubMsg) unsubMsg();
+            if (unsubUsers) unsubUsers();
         };
     }, [currentUser, playString]); 
 
@@ -207,16 +203,11 @@ useEffect(() => {
     const handleJoinRoom = (roomId: string) => {
         if (!currentUser) return;
         
-        // --- CRITICAL FIX: Wake up Audio Engine on User Click ---
-        // This unlocks the browser's audio policy immediately.
+        // --- Wake up Audio Engine ---
         initRemoteAudio(); 
-        if (remoteAudioCtx.current?.state === 'suspended') {
-            remoteAudioCtx.current.resume();
-        }
-        // --------------------------------------------------------
-
+        
         setCurrentRoomId(roomId);
-        setMessages([]); // Clear previous messages
+        setMessages([]); 
         chatService.joinRoom(currentUser, roomId);
         setView('chat');
     };
@@ -226,7 +217,6 @@ useEffect(() => {
         setCurrentRoomId(null);
         setView('lobby');
         stopTone();
-        // Force stop remote tone
         if (remoteAudioCtx.current && remoteGain.current) {
              remoteGain.current.gain.cancelScheduledValues(remoteAudioCtx.current.currentTime);
              remoteGain.current.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
@@ -243,7 +233,6 @@ useEffect(() => {
 
     // --- Paddle Interaction ---
     const handleInteraction = (side: 'left' | 'right', pressed: boolean) => {
-        // Only allow transmission in chat mode
         if (view === 'chat') {
             setPaddle(side, pressed);
             if (side === 'left') setVisualLeft(pressed);
@@ -255,20 +244,12 @@ useEffect(() => {
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.repeat) return;
-            
-            // Iambic Controls
             if (e.code === 'KeyZ' || e.code === 'ArrowLeft') handleInteraction('left', true);
             if (e.code === 'KeyX' || e.code === 'ArrowRight') handleInteraction('right', true);
-            
-            // Straight Key (Spacebar)
             if (e.code === 'Space') {
-                e.preventDefault(); // Prevent scrolling
-                if (settings.mode === 'straight') {
-                    handleInteraction('left', true);
-                }
+                e.preventDefault(); 
+                if (settings.mode === 'straight') handleInteraction('left', true);
             }
-
-            // Chat Controls
             if (e.code === 'Enter' && view === 'chat') handleSendMessage();
             if (e.code === 'Backspace') setInputBuffer(prev => prev.slice(0, -1));
         };
@@ -276,16 +257,12 @@ useEffect(() => {
         const handleKeyUp = (e: KeyboardEvent) => {
             if (e.code === 'KeyZ' || e.code === 'ArrowLeft') handleInteraction('left', false);
             if (e.code === 'KeyX' || e.code === 'ArrowRight') handleInteraction('right', false);
-            
-            if (e.code === 'Space' && settings.mode === 'straight') {
-                handleInteraction('left', false);
-            }
+            if (e.code === 'Space' && settings.mode === 'straight') handleInteraction('left', false);
         };
 
         window.addEventListener('keydown', handleKeyDown);
         window.addEventListener('keyup', handleKeyUp);
         
-        // Safety: Global release listener to prevent "stuck" keys if dragging out of window/component
         const handleGlobalRelease = () => {
              handleInteraction('left', false);
              handleInteraction('right', false);
@@ -303,50 +280,31 @@ useEffect(() => {
 
     return (
         <div className="flex flex-col h-dvh max-w-4xl mx-auto p-4 md:p-6 gap-4">
-            
-            {/* Header (Only show in Lobby or Chat) */}
             {view !== 'login' && (
                 <header className="flex justify-between items-center shrink-0">
                     <div className="flex items-center gap-3">
                         <div className={`w-3 h-3 rounded-full transition-all duration-100 ${isTransmitting ? 'bg-primary shadow-[0_0_15px_rgba(59,130,246,0.8)] scale-110' : 'bg-element'}`}></div>
                         <h1 className="text-xl font-bold tracking-tight">Morse<span className="text-primary">Pro</span> Net</h1>
                     </div>
-                    
-                    <button 
-                        onClick={() => setShowSettings(!showSettings)}
-                        className={`p-2 rounded-lg border transition-all ${showSettings ? 'bg-active border-textMuted text-white' : 'bg-transparent border-element text-textMuted hover:bg-element'}`}
-                    >
+                    <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded-lg border transition-all ${showSettings ? 'bg-active border-textMuted text-white' : 'bg-transparent border-element text-textMuted hover:bg-element'}`}>
                         <Settings className="w-5 h-5" />
                     </button>
                 </header>
             )}
 
-            {/* Settings Drawer */}
             <div className={`overflow-hidden transition-all duration-300 ease-in-out ${showSettings && view !== 'login' ? 'max-h-60 opacity-100 mb-4' : 'max-h-0 opacity-0'}`}>
                 <div className="bg-panel border border-element rounded-xl p-4 grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div className="space-y-1">
                         <label className="text-xs font-bold text-textMuted uppercase">WPM: {settings.wpm}</label>
-                        <input 
-                            type="range" min="5" max="40" value={settings.wpm} 
-                            onChange={(e) => setSettings({...settings, wpm: Number(e.target.value)})}
-                            className="w-full h-2 bg-element rounded-lg appearance-none cursor-pointer accent-primary"
-                        />
+                        <input type="range" min="5" max="40" value={settings.wpm} onChange={(e) => setSettings({...settings, wpm: Number(e.target.value)})} className="w-full h-2 bg-element rounded-lg appearance-none cursor-pointer accent-primary" />
                     </div>
                     <div className="space-y-1">
                         <label className="text-xs font-bold text-textMuted uppercase">Tone: {settings.tone}Hz</label>
-                        <input 
-                            type="range" min="400" max="1000" value={settings.tone} 
-                            onChange={(e) => setSettings({...settings, tone: Number(e.target.value)})}
-                            className="w-full h-2 bg-element rounded-lg appearance-none cursor-pointer accent-primary"
-                        />
+                        <input type="range" min="400" max="1000" value={settings.tone} onChange={(e) => setSettings({...settings, tone: Number(e.target.value)})} className="w-full h-2 bg-element rounded-lg appearance-none cursor-pointer accent-primary" />
                     </div>
                      <div className="space-y-1">
                         <label className="text-xs font-bold text-textMuted uppercase">Mode</label>
-                        <select 
-                            value={settings.mode}
-                            onChange={(e) => setSettings({...settings, mode: e.target.value as any})}
-                            className="w-full bg-element text-sm p-1.5 rounded-md border border-element outline-none focus:border-primary"
-                        >
+                        <select value={settings.mode} onChange={(e) => setSettings({...settings, mode: e.target.value as any})} className="w-full bg-element text-sm p-1.5 rounded-md border border-element outline-none focus:border-primary">
                             <option value="straight">Straight Key</option>
                             <option value="iambic-a">Iambic A</option>
                             <option value="iambic-b">Iambic B</option>
@@ -355,73 +313,22 @@ useEffect(() => {
                 </div>
             </div>
 
-            {/* Main Content */}
             <main className="flex-1 min-h-0 relative z-10">
-                {view === 'login' && (
-                    <LoginScreen onJoin={handleLogin} />
-                )}
-                
-                {view === 'lobby' && currentUser && (
-                    <Lobby 
-                        rooms={AVAILABLE_ROOMS} 
-                        onSelectRoom={handleJoinRoom} 
-                        userCallsign={currentUser.callsign}
-                    />
-                )}
-                
-                {view === 'chat' && currentRoomId && (
-                    <ChatInterface 
-                        messages={messages} 
-                        users={users}
-                        currentInput={inputBuffer}
-                        frequency={AVAILABLE_ROOMS.find(r => r.id === currentRoomId)?.frequency || '0.000'}
-                        onClearInput={() => setInputBuffer('')}
-                        onSendMessage={handleSendMessage}
-                        onLeaveRoom={handleLeaveRoom}
-                    />
-                )}
+                {view === 'login' && <LoginScreen onJoin={handleLogin} />}
+                {view === 'lobby' && currentUser && <Lobby rooms={AVAILABLE_ROOMS} onSelectRoom={handleJoinRoom} userCallsign={currentUser.callsign} />}
+                {view === 'chat' && currentRoomId && <ChatInterface messages={messages} users={users} currentInput={inputBuffer} frequency={AVAILABLE_ROOMS.find(r => r.id === currentRoomId)?.frequency || '0.000'} onClearInput={() => setInputBuffer('')} onSendMessage={handleSendMessage} onLeaveRoom={handleLeaveRoom} />}
             </main>
 
-            {/* Paddles (Only in Chat) */}
             {view === 'chat' && (
                 <section className="h-40 md:h-48 shrink-0 flex gap-4 mt-2 select-none touch-none">
-                    {/* Left Paddle / Straight Key */}
-                    <div 
-                        className={`flex-1 rounded-2xl border transition-all duration-75 cursor-pointer relative overflow-hidden group
-                            ${visualLeft 
-                                ? 'bg-element border-primary translate-y-1' 
-                                : 'bg-panel border-element hover:bg-element'
-                            }
-                        `}
-                        onMouseDown={(e) => { e.preventDefault(); handleInteraction('left', true); }}
-                        onMouseUp={(e) => { e.preventDefault(); handleInteraction('left', false); }}
-                        onMouseLeave={() => handleInteraction('left', false)}
-                        onTouchStart={(e) => { e.preventDefault(); handleInteraction('left', true); }}
-                        onTouchEnd={(e) => { e.preventDefault(); handleInteraction('left', false); }}
-                    >
+                    <div className={`flex-1 rounded-2xl border transition-all duration-75 cursor-pointer relative overflow-hidden group ${visualLeft ? 'bg-element border-primary translate-y-1' : 'bg-panel border-element hover:bg-element'}`} onMouseDown={(e) => { e.preventDefault(); handleInteraction('left', true); }} onMouseUp={(e) => { e.preventDefault(); handleInteraction('left', false); }} onMouseLeave={() => handleInteraction('left', false)} onTouchStart={(e) => { e.preventDefault(); handleInteraction('left', true); }} onTouchEnd={(e) => { e.preventDefault(); handleInteraction('left', false); }}>
                         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
                             <span className={`text-6xl font-mono transition-colors ${visualLeft ? 'text-primary' : 'text-element'}`}>•</span>
-                            <span className="text-xs font-bold tracking-widest text-textMuted mt-2">
-                                {settings.mode === 'straight' ? 'STRAIGHT KEY (SPACE)' : 'DIT (Z)'}
-                            </span>
+                            <span className="text-xs font-bold tracking-widest text-textMuted mt-2">{settings.mode === 'straight' ? 'STRAIGHT KEY (SPACE)' : 'DIT (Z)'}</span>
                         </div>
                     </div>
-
-                    {/* Right Paddle (Hidden in Straight Mode) */}
                     {settings.mode !== 'straight' && (
-                        <div 
-                            className={`flex-1 rounded-2xl border transition-all duration-75 cursor-pointer relative overflow-hidden group
-                                ${visualRight 
-                                    ? 'bg-element border-primary translate-y-1' 
-                                    : 'bg-panel border-element hover:bg-element'
-                                }
-                            `}
-                            onMouseDown={(e) => { e.preventDefault(); handleInteraction('right', true); }}
-                            onMouseUp={(e) => { e.preventDefault(); handleInteraction('right', false); }}
-                            onMouseLeave={() => handleInteraction('right', false)}
-                            onTouchStart={(e) => { e.preventDefault(); handleInteraction('right', true); }}
-                            onTouchEnd={(e) => { e.preventDefault(); handleInteraction('right', false); }}
-                        >
+                        <div className={`flex-1 rounded-2xl border transition-all duration-75 cursor-pointer relative overflow-hidden group ${visualRight ? 'bg-element border-primary translate-y-1' : 'bg-panel border-element hover:bg-element'}`} onMouseDown={(e) => { e.preventDefault(); handleInteraction('right', true); }} onMouseUp={(e) => { e.preventDefault(); handleInteraction('right', false); }} onMouseLeave={() => handleInteraction('right', false)} onTouchStart={(e) => { e.preventDefault(); handleInteraction('right', true); }} onTouchEnd={(e) => { e.preventDefault(); handleInteraction('right', false); }}>
                              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
                                 <span className={`text-6xl font-mono transition-colors ${visualRight ? 'text-primary' : 'text-element'}`}>-</span>
                                 <span className="text-xs font-bold tracking-widest text-textMuted mt-2">DAH (X)</span>
@@ -431,12 +338,7 @@ useEffect(() => {
                 </section>
             )}
             
-            {/* Footer for non-chat views */}
-            {view !== 'chat' && (
-                <div className="text-center text-textMuted text-xs mt-auto opacity-50">
-                    <p>Designed for High Fidelity Morse Operations</p>
-                </div>
-            )}
+            {view !== 'chat' && <div className="text-center text-textMuted text-xs mt-auto opacity-50"><p>Designed for High Fidelity Morse Operations</p></div>}
         </div>
     );
 };
