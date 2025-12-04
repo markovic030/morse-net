@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { SignalEvent } from '../types';
 
-// Buffer: 300-500ms is standard for Morse over IP
-const BUFFER_MS = 400; 
-const LOOKAHEAD_MS = 100;
+const BUFFER_MS = 300; // Latency Target
+const LOOKAHEAD_MS = 100; // React Safety Window
+const IDLE_TIMEOUT_MS = 2000; // Reset sync if silent for 2 seconds
 
 export const useJitterBuffer = (
     ctx: AudioContext | null, 
@@ -11,15 +11,16 @@ export const useJitterBuffer = (
 ) => {
     const queue = useRef<SignalEvent[]>([]);
     const timeOffset = useRef<number | null>(null);
-    
-    // Track timing to preserve duration
     const lastSenderTime = useRef<number | null>(null);
     const lastScheduledTime = useRef<number>(0);
+    
+    // Timer to reset sync if the conversation stops
+    const resyncTimer = useRef<NodeJS.Timeout | null>(null);
 
     const addEvent = (event: SignalEvent) => {
         if (!ctx) return;
 
-        // Initialize sync on first packet
+        // 1. Initialize Sync (First Packet)
         if (timeOffset.current === null) {
             const targetTime = ctx.currentTime + (BUFFER_MS / 1000);
             timeOffset.current = targetTime - (event.timestamp / 1000);
@@ -27,16 +28,19 @@ export const useJitterBuffer = (
         
         queue.current.push(event);
 
-        // --- THE FIX IS HERE ---
-        // We sort primarily by Timestamp. We only use Sequence as a tie-breaker.
+        // 2. Critical Sort (Timestamp first, then Sequence)
         queue.current.sort((a, b) => {
-            // If timestamps are different, use them (Reliable ordering)
-            if (a.timestamp !== b.timestamp) {
-                return a.timestamp - b.timestamp;
-            }
-            // If timestamps are EXACTLY the same (rare), use sequence
-            return a.seq - b.seq;
+            if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+            return (a.seq || 0) - (b.seq || 0);
         });
+
+        // 3. Reset the Idle Timer
+        if (resyncTimer.current) clearTimeout(resyncTimer.current);
+        resyncTimer.current = setTimeout(() => {
+            // If no data for 2 seconds, reset offset so next sentence starts fresh
+            timeOffset.current = null;
+            lastSenderTime.current = null;
+        }, IDLE_TIMEOUT_MS);
     };
 
     useEffect(() => {
@@ -52,27 +56,25 @@ export const useJitterBuffer = (
 
             while (queue.current.length > 0) {
                 const nextEvent = queue.current[0];
-                
-                // Calculate ideal play time
                 let scheduledTime = (nextEvent.timestamp / 1000) + timeOffset.current;
 
-                // Duration Preservation:
-                // Ensure we don't crush the "dit" length if network jitter compressed the packets
+                // 4. Duration Preservation
+                // Ensure fast dits aren't crushed by network jitter
                 if (lastSenderTime.current !== null && lastScheduledTime.current > 0) {
-                    const duration = (nextEvent.timestamp - lastSenderTime.current) / 1000;
-                    if (duration > 0) {
-                        scheduledTime = Math.max(scheduledTime, lastScheduledTime.current + duration);
+                    const originalDuration = (nextEvent.timestamp - lastSenderTime.current) / 1000;
+                    if (originalDuration > 0) {
+                        // The next note cannot start earlier than (LastNote + Duration)
+                        scheduledTime = Math.max(scheduledTime, lastScheduledTime.current + originalDuration);
                     }
                 }
 
                 if (scheduledTime < lookaheadTime) {
-                    // Schedule it!
-                    // We use Math.max(currentTime) to ensure we don't error by scheduling in the past
+                    // 5. Schedule execution
+                    // Ensure we don't error by scheduling in the past
                     const playTime = Math.max(ctx.currentTime, scheduledTime);
                     
                     scheduleSignal(nextEvent.state, playTime);
                     
-                    // Update trackers
                     lastScheduledTime.current = playTime;
                     lastSenderTime.current = nextEvent.timestamp;
 
@@ -85,7 +87,11 @@ export const useJitterBuffer = (
         };
 
         animationFrameId = requestAnimationFrame(scheduleLoop);
-        return () => cancelAnimationFrame(animationFrameId);
+
+        return () => {
+            cancelAnimationFrame(animationFrameId);
+            if (resyncTimer.current) clearTimeout(resyncTimer.current);
+        };
     }, [ctx, scheduleSignal]);
 
     return { addEvent };
