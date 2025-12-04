@@ -142,24 +142,24 @@ class ChatService {
         push(signalRef, event);
     }
 
-    public subscribeToSignals(callback: (event: SignalEvent) => void) {
+public subscribeToSignals(callback: (event: SignalEvent) => void) {
         if (!this.currentRoomId) return () => {};
 
-        // UPDATED: Listen to last 100 to catch fast bursts
+        // 1. Capture the exact time we started listening
+        const subscriptionStartTime = Date.now();
+
         const signalsRef = query(
             ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/signals`),
             limitToLast(100) 
         );
 
-        // UPDATED: Use onChildAdded to ensure NO packet is ever skipped
         const unsub = onChildAdded(signalsRef, (snapshot) => {
             const event = snapshot.val() as SignalEvent;
             
-            // Only pass it if it's new (timestamp check) and not from us
-            // We use a small threshold (10 seconds) to ignore old history when joining
-            const isRecent = Date.now() - event.timestamp < 10000;
-            
-            if (isRecent && event.senderId !== this.currentUser?.id) {
+            // 2. STRICT FILTER: 
+            // Only allow events that happened AFTER we subscribed.
+            // This effectively mutes all "history" so we start fresh.
+            if (event.timestamp > subscriptionStartTime && event.senderId !== this.currentUser?.id) {
                 callback(event);
             }
         });
