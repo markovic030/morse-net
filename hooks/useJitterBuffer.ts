@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react';
 import { SignalEvent } from '../types';
 
-// Buffer: 500ms is a safe starting point for mobile networks
-const BUFFER_MS = 500; 
+// Buffer: 300-500ms is standard for Morse over IP
+const BUFFER_MS = 400; 
 const LOOKAHEAD_MS = 100;
 
 export const useJitterBuffer = (
@@ -12,8 +12,7 @@ export const useJitterBuffer = (
     const queue = useRef<SignalEvent[]>([]);
     const timeOffset = useRef<number | null>(null);
     
-    // We track the Sender's time of the last processed event
-    // to preserve the relative rhythm (duration between Down and Up)
+    // Track timing to preserve duration
     const lastSenderTime = useRef<number | null>(null);
     const lastScheduledTime = useRef<number>(0);
 
@@ -27,9 +26,17 @@ export const useJitterBuffer = (
         }
         
         queue.current.push(event);
-        // Important: Sort by Sequence ID if available, else Timestamp
-        // This fixes "out of order" packet arrival
-        queue.current.sort((a, b) => (a.seq || a.timestamp) - (b.seq || b.timestamp));
+
+        // --- THE FIX IS HERE ---
+        // We sort primarily by Timestamp. We only use Sequence as a tie-breaker.
+        queue.current.sort((a, b) => {
+            // If timestamps are different, use them (Reliable ordering)
+            if (a.timestamp !== b.timestamp) {
+                return a.timestamp - b.timestamp;
+            }
+            // If timestamps are EXACTLY the same (rare), use sequence
+            return a.seq - b.seq;
+        });
     };
 
     useEffect(() => {
@@ -46,26 +53,21 @@ export const useJitterBuffer = (
             while (queue.current.length > 0) {
                 const nextEvent = queue.current[0];
                 
-                // Calculate ideal play time based on initial sync
+                // Calculate ideal play time
                 let scheduledTime = (nextEvent.timestamp / 1000) + timeOffset.current;
 
-                // DURATION PRESERVATION LOGIC:
-                // If this is a "Key Up" (0) following a "Key Down" (1),
-                // we must ensure the duration is correct relative to the PREVIOUS packet.
-                // If we delayed the previous packet by 0.1s due to lag, we MUST delay this one too.
+                // Duration Preservation:
+                // Ensure we don't crush the "dit" length if network jitter compressed the packets
                 if (lastSenderTime.current !== null && lastScheduledTime.current > 0) {
                     const duration = (nextEvent.timestamp - lastSenderTime.current) / 1000;
-                    // The play time must be at least (LastPlayTime + Duration)
-                    // This prevents "crushing" dits if the Up packet arrives early/late
                     if (duration > 0) {
                         scheduledTime = Math.max(scheduledTime, lastScheduledTime.current + duration);
                     }
                 }
 
                 if (scheduledTime < lookaheadTime) {
-                    // Safety: Never schedule in the past
-                    // But if we shift it, update the offset so future notes stay in sync? 
-                    // For now, just clamping it creates a small stutter but preserves the note.
+                    // Schedule it!
+                    // We use Math.max(currentTime) to ensure we don't error by scheduling in the past
                     const playTime = Math.max(ctx.currentTime, scheduledTime);
                     
                     scheduleSignal(nextEvent.state, playTime);
