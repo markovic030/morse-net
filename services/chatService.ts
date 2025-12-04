@@ -1,10 +1,11 @@
-import { ChatMessage, Room, User, SignalEvent } from '../types'; // Ensure types.ts has SignalEvent
-import { db } from '../src/firebaseConfig'; // Points to src/firebaseConfig.ts
+import { ChatMessage, Room, User, SignalEvent } from '../types'; 
+import { db } from '../src/firebaseConfig'; 
 import { 
   ref, 
   set, 
   push, 
-  onValue, 
+  onValue,
+  onChildAdded, // <--- NEW IMPORT
   remove, 
   update, 
   onDisconnect, 
@@ -29,6 +30,9 @@ class ChatService {
     private messageListeners: ((msg: ChatMessage) => void)[] = [];
     private userListeners: ((users: User[]) => void)[] = [];
     
+    // NEW: Sequence counter to prevent ordering issues with fast keying
+    private sequenceCounter = 0;
+
     private currentUser: User | null = null;
     private currentRoomId: string | null = null;
     
@@ -120,7 +124,7 @@ class ChatService {
         set(newMsgRef, msg);
     }
 
-    // --- SIGNAL METHODS (THESE WERE MISSING) ---
+    // --- SIGNAL METHODS (UPDATED FOR HIGH SPEED) ---
 
     public sendSignal(state: 0 | 1) {
         if (!this.currentUser || !this.currentRoomId) return;
@@ -130,7 +134,8 @@ class ChatService {
         const event: SignalEvent = {
             senderId: this.currentUser.id,
             state: state,
-            seq: Date.now(),
+            // UPDATED: Use counter instead of just Date.now() to preserve strict order
+            seq: this.sequenceCounter++,
             timestamp: Date.now()
         };
 
@@ -140,18 +145,22 @@ class ChatService {
     public subscribeToSignals(callback: (event: SignalEvent) => void) {
         if (!this.currentRoomId) return () => {};
 
+        // UPDATED: Listen to last 100 to catch fast bursts
         const signalsRef = query(
             ref(db, `${DB_PREFIX}/rooms/${this.currentRoomId}/signals`),
-            limitToLast(1) 
+            limitToLast(100) 
         );
 
-        const unsub = onValue(signalsRef, (snapshot) => {
-            const data = snapshot.val();
-            if (data) {
-                const event = Object.values(data)[0] as SignalEvent;
-                if (event.senderId !== this.currentUser?.id) {
-                    callback(event);
-                }
+        // UPDATED: Use onChildAdded to ensure NO packet is ever skipped
+        const unsub = onChildAdded(signalsRef, (snapshot) => {
+            const event = snapshot.val() as SignalEvent;
+            
+            // Only pass it if it's new (timestamp check) and not from us
+            // We use a small threshold (10 seconds) to ignore old history when joining
+            const isRecent = Date.now() - event.timestamp < 10000;
+            
+            if (isRecent && event.senderId !== this.currentUser?.id) {
+                callback(event);
             }
         });
 
