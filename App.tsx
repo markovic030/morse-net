@@ -143,24 +143,28 @@ const App: React.FC = () => {
 // =========================================================
     // 3. TRUE REMOTE KEYING: SENDER (BROADCAST)
     // =========================================================
-    useEffect(() => {
+useEffect(() => {
         if (view === 'chat') {
             chatService.updateStatus(isTransmitting ? 'tx' : 'idle');
             chatService.sendSignal(isTransmitting ? 1 : 0);
 
-            // --- AUDIO CONFLICT FIX ---
-            // If we are transmitting, SUSPEND the remote audio engine.
-            // This frees up the AudioContext so your local paddles don't glitch.
+            // --- AGGRESSIVE AUDIO OPTIMIZATION ---
             if (remoteAudioCtx.current) {
                 if (isTransmitting) {
+                    // If we start typing, instantly SUSPEND remote audio.
+                    // This gives 100% CPU priority to your local keyer.
                     if (remoteAudioCtx.current.state === 'running') {
                         remoteAudioCtx.current.suspend();
                     }
                 } else {
-                    // When we stop transmitting, wake it up to listen
-                    if (remoteAudioCtx.current.state === 'suspended') {
-                        remoteAudioCtx.current.resume();
-                    }
+                    // When we stop, wait a tiny bit (50ms) before resuming.
+                    // This prevents "thrashing" if you just paused for a split second between words.
+                    setTimeout(() => {
+                        // Only resume if we are still NOT transmitting
+                        if (!isTransmitting && remoteAudioCtx.current?.state === 'suspended') {
+                            remoteAudioCtx.current.resume();
+                        }
+                    }, 50);
                 }
             }
         }
