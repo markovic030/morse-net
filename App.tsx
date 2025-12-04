@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useMorseKeyer } from './hooks/useMorseKeyer';
 import { ChatInterface } from './components/ChatInterface';
 import { LoginScreen } from './components/LoginScreen';
@@ -6,6 +6,8 @@ import { Lobby } from './components/Lobby';
 import { chatService, AVAILABLE_ROOMS } from './services/chatService';
 import { KeyerSettings, ChatMessage, User } from './types';
 import { Settings } from 'lucide-react';
+// NEW: Import the Jitter Buffer hook
+import { useJitterBuffer } from './hooks/useJitterBuffer';
 
 type AppState = 'login' | 'lobby' | 'chat';
 
@@ -45,20 +47,112 @@ const App: React.FC = () => {
 
     const { setPaddle, playString, isTransmitting, stopTone } = useMorseKeyer(settings, handleCharDecoded, handleWordGap);
 
-    // --- Status Sync Effect ---
-    // This broadcasts your TX status to other users when you are keying
+    // =========================================================
+    // 1. TRUE REMOTE KEYING: REMOTE AUDIO ENGINE
+    // =========================================================
+    // We need a dedicated oscillator for the *remote* signal so it doesn't 
+    // conflict with your local keyer's state.
+    const remoteAudioCtx = useRef<AudioContext | null>(null);
+    const remoteOsc = useRef<OscillatorNode | null>(null);
+    const remoteGain = useRef<GainNode | null>(null);
+
+    const startRemoteTone = useCallback(() => {
+        if (!remoteAudioCtx.current) {
+            remoteAudioCtx.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (remoteAudioCtx.current.state === 'suspended') {
+            remoteAudioCtx.current.resume();
+        }
+        
+        // If already playing, don't restart
+        if (remoteOsc.current) return;
+
+        const osc = remoteAudioCtx.current.createOscillator();
+        const gain = remoteAudioCtx.current.createGain();
+
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(settings.tone, remoteAudioCtx.current.currentTime); // Use same tone as settings
+        
+        gain.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
+        gain.gain.linearRampToValueAtTime(0.5, remoteAudioCtx.current.currentTime + 0.005); // Smooth attack
+
+        osc.connect(gain);
+        gain.connect(remoteAudioCtx.current.destination);
+        osc.start();
+
+        remoteOsc.current = osc;
+        remoteGain.current = gain;
+    }, [settings.tone]);
+
+    const stopRemoteTone = useCallback(() => {
+        if (remoteOsc.current && remoteGain.current && remoteAudioCtx.current) {
+            const osc = remoteOsc.current;
+            const gain = remoteGain.current;
+            const ctx = remoteAudioCtx.current;
+
+            // Smooth release
+            gain.gain.setValueAtTime(gain.gain.value, ctx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.005);
+            
+            setTimeout(() => {
+                osc.stop();
+                osc.disconnect();
+                gain.disconnect();
+            }, 10); // Wait for release
+
+            remoteOsc.current = null;
+            remoteGain.current = null;
+        }
+    }, []);
+
+    // =========================================================
+    // 2. TRUE REMOTE KEYING: RECEIVER (JITTER BUFFER)
+    // =========================================================
+    // Initialize the Time Machine
+    const { addEvent } = useJitterBuffer(startRemoteTone, stopRemoteTone);
+
+    // Subscribe to incoming raw signals
+    useEffect(() => {
+        // Only subscribe if we are in a room
+        if (view === 'chat' && currentRoomId) {
+            const unsubSignals = chatService.subscribeToSignals((event) => {
+                addEvent(event);
+            });
+            return () => {
+                unsubSignals();
+                stopRemoteTone(); // Cleanup on unmount/leave
+            };
+        }
+    }, [view, currentRoomId, addEvent, stopRemoteTone]);
+
+
+    // =========================================================
+    // 3. TRUE REMOTE KEYING: SENDER (BROADCAST)
+    // =========================================================
     useEffect(() => {
         if (view === 'chat') {
+            // Update Presence Status (visual "TX" indicator)
             chatService.updateStatus(isTransmitting ? 'tx' : 'idle');
+
+            // --- SEND RAW SIGNAL ---
+            // Whenever your local keyer starts/stops transmitting, we send that state to the network.
+            // 1 = Key Down, 0 = Key Up
+            chatService.sendSignal(isTransmitting ? 1 : 0);
         }
     }, [isTransmitting, view]);
 
-    // --- Service Subscription ---
+
+    // --- Service Subscription (Existing) ---
     useEffect(() => {
         const unsubMsg = chatService.subscribeToMessages((msg) => {
             setMessages(prev => [...prev, msg]);
-            if (!msg.isSystem && msg.senderId !== currentUser?.id) {
-                playString(msg.text); // Play received messages
+            
+            // MODIFIED: Only play computer-generated audio for SYSTEM messages.
+            // For user messages, we rely on the True Remote Keying (Raw Audio) we added above.
+            // If you keep playString() here, you will hear "Double Audio" (Raw + Computer).
+            if (msg.isSystem && msg.senderId !== currentUser?.id) {
+                // Keep playing system messages (e.g., "CONNECTED") with computer voice
+                playString(msg.text); 
             }
         });
 
@@ -70,7 +164,7 @@ const App: React.FC = () => {
             unsubMsg();
             unsubUsers();
         };
-    }, [currentUser, playString]); // Added playString to deps
+    }, [currentUser, playString]); 
 
     // --- Actions ---
     const handleLogin = (callsign: string) => {
@@ -97,6 +191,8 @@ const App: React.FC = () => {
         setCurrentRoomId(null);
         setView('lobby');
         stopTone();
+        // Also kill remote tone
+        stopRemoteTone();
         setMessages([]);
     };
 
@@ -165,7 +261,7 @@ const App: React.FC = () => {
             window.removeEventListener('mouseup', handleGlobalRelease);
             window.removeEventListener('touchend', handleGlobalRelease);
         };
-    }, [view, inputBuffer, settings.mode]); // Added settings.mode to deps
+    }, [view, inputBuffer, settings.mode]); 
 
     return (
         <div className="flex flex-col h-dvh max-w-4xl mx-auto p-4 md:p-6 gap-4">
