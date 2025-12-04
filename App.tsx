@@ -93,7 +93,7 @@ const App: React.FC = () => {
 
     // The Scheduler: Just automates the Volume (Gain)
     const scheduleRemoteSignal = useCallback((state: 0 | 1, time: number) => {
-        // Ensure engine is ready
+        // Ensure engine is ready (though we try to init on join)
         initRemoteAudio();
         
         const ctx = remoteAudioCtx.current;
@@ -102,17 +102,10 @@ const App: React.FC = () => {
         if (!ctx || !gain) return;
 
         // Safety: If 'time' is in the past, move it to 'now' to avoid errors
-        // WebAudio scheduling strictly prohibits past times for ramps
         const safeTime = Math.max(time, ctx.currentTime);
-
-        // Cancel any future scheduled changes to prevent conflict
-        // (Optional: depending on how aggressive you want to be)
-        // gain.gain.cancelScheduledValues(safeTime);
 
         if (state === 1) {
             // OPEN GATE (Volume 0 -> 0.5)
-            // We use setTargetAtTime for an exponential approach (more natural)
-            // or linearRamp for strict timing. Linear is better for Morse.
             gain.gain.setValueAtTime(0, safeTime); 
             gain.gain.linearRampToValueAtTime(0.5, safeTime + 0.005); // 5ms attack
         } else {
@@ -129,23 +122,9 @@ const App: React.FC = () => {
     // We pass the Context and the Scheduler function to the hook
     const { addEvent } = useJitterBuffer(remoteAudioCtx.current, scheduleRemoteSignal);
 
-    // Initialize Audio Context on first user interaction (browser policy)
-    useEffect(() => {
-        const initAudio = () => { initRemoteAudio(); }; // Changed to call initRemoteAudio directly
-        window.addEventListener('click', initAudio, { once: true });
-        window.addEventListener('keydown', initAudio, { once: true });
-        return () => {
-            window.removeEventListener('click', initAudio);
-            window.removeEventListener('keydown', initAudio);
-        };
-    }, [initRemoteAudio]);
-
     // Subscribe to incoming raw signals
     useEffect(() => {
         if (view === 'chat' && currentRoomId) {
-            // Make sure context is created when entering chat
-            initRemoteAudio(); 
-            
             const unsubSignals = chatService.subscribeToSignals((event) => {
                 addEvent(event);
             });
@@ -153,13 +132,12 @@ const App: React.FC = () => {
                 unsubSignals();
                 // Force stop any lingering sound
                 if (remoteAudioCtx.current && remoteGain.current) {
-                     // Immediately silence
                      remoteGain.current.gain.cancelScheduledValues(remoteAudioCtx.current.currentTime);
                      remoteGain.current.gain.setValueAtTime(0, remoteAudioCtx.current.currentTime);
                 }
             };
         }
-    }, [view, currentRoomId, addEvent, initRemoteAudio, scheduleRemoteSignal]); // Updated dependency
+    }, [view, currentRoomId, addEvent, initRemoteAudio, scheduleRemoteSignal]); 
 
 
     // =========================================================
@@ -184,10 +162,7 @@ const App: React.FC = () => {
             setMessages(prev => [...prev, msg]);
             
             // MODIFIED: Only play computer-generated audio for SYSTEM messages.
-            // For user messages, we rely on the True Remote Keying (Raw Audio) we added above.
-            // If you keep playString() here, you will hear "Double Audio" (Raw + Computer).
             if (msg.isSystem && msg.senderId !== currentUser?.id) {
-                // Keep playing system messages (e.g., "CONNECTED") with computer voice
                 playString(msg.text); 
             }
         });
@@ -216,6 +191,15 @@ const App: React.FC = () => {
 
     const handleJoinRoom = (roomId: string) => {
         if (!currentUser) return;
+        
+        // --- CRITICAL FIX: Wake up Audio Engine on User Click ---
+        // This unlocks the browser's audio policy immediately.
+        initRemoteAudio(); 
+        if (remoteAudioCtx.current?.state === 'suspended') {
+            remoteAudioCtx.current.resume();
+        }
+        // --------------------------------------------------------
+
         setCurrentRoomId(roomId);
         setMessages([]); // Clear previous messages
         chatService.joinRoom(currentUser, roomId);
