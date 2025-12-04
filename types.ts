@@ -43,3 +43,10 @@ export interface SignalEvent {
     seq: number;       // To detect lost packets
     timestamp: number; // Sender's local time
 }
+// Add this to your src/types.ts
+export interface SignalBatch {
+    senderId: string;
+    baseTime: number; // The timestamp of the first event in this batch
+    events: number[]; // Relative offsets: [0, 80, 150, 230] (On at 0, Off at 80, On at 150...)
+    seq: number;
+}
